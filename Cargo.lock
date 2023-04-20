@@ -3303,6 +3303,7 @@ dependencies = [
  "anyhow",
  "argh",
  "ethers",
+ "futures",
  "serde",
  "serde_json",
  "tokio",
