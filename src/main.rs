@@ -18,8 +18,16 @@ struct VersusConfig {
     rpcs: Vec<String>,
 
     /// how many rpc calls to test
+    /// TODO: make this optional. if not set, read all of them
     #[argh(option, default = "default_count()")]
     count: usize,
+}
+
+#[derive(Clone, Deserialize, Debug, PartialEq, Eq)]
+#[serde(untagged)]
+enum JsonRpcRequestEnum {
+    Request(JsonRpcRequest),
+    Batch(Vec<JsonRpcRequest>),
 }
 
 #[derive(Clone, Deserialize, Debug, PartialEq, Eq)]
@@ -71,23 +79,39 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // TODO: how should we handle lagged? for now we just set a potentially very high capacity
-    let (tx, _) = broadcast::channel::<(usize, JsonRpcRequest)>(config.count);
+    // TODO: i'd like to be able to send raw Strings so th
+    let (tx, _) = broadcast::channel::<(usize, JsonRpcRequestEnum)>(config.count);
 
     let mut handles = Vec::with_capacity(num_providers);
 
+    // TODO: i don't like this. we have to keep all results in memory until the end. change to wait for all of them and then do the processing
     for p in http_providers {
         let mut rx = tx.subscribe();
 
         let mut results = HashMap::with_capacity(config.count);
 
         let handle = tokio::spawn(async move {
-            while let Ok((i, data)) = rx.recv().await {
+            while let Ok((id, data)) = rx.recv().await {
                 // println!("{} {}: {:?}", p.url(), i, data);
 
-                let response: Result<serde_json::Value, ProviderError> =
-                    p.request(&data.method, &data.params).await;
+                match data {
+                    JsonRpcRequestEnum::Request(request) => {
+                        // TODO: spawn this so we can run in parallel
+                        let response: Result<serde_json::Value, ProviderError> =
+                            p.request(&request.method, &request.params).await;
 
-                results.insert(i, (data, response));
+                        results.insert(id, (request, response));
+                    }
+                    JsonRpcRequestEnum::Batch(batch) => {
+                        for request in batch {
+                            // TODO: spawn this so we can run in parallel
+                            let response: Result<serde_json::Value, ProviderError> =
+                                p.request(&request.method, &request.params).await;
+
+                            results.insert(id, (request, response));
+                        }
+                    }
+                }
             }
 
             (p, results)
@@ -105,17 +129,24 @@ async fn main() -> anyhow::Result<()> {
     let mut lines = reader.lines();
 
     while let Some(line) = lines.next_line().await? {
-        let data: JsonRpcRequest = serde_json::from_str(&line)?;
+        match serde_json::from_str::<JsonRpcRequestEnum>(&line) {
+            Ok(data) => {
+                tx.send((count, data)).expect("unable to send");
 
-        tx.send((count, data)).expect("unable to send");
-
-        count += 1;
-        if count >= config.count {
-            break;
+                count += 1;
+                if count >= config.count {
+                    break;
+                }
+            }
+            Err(err) => {
+                println!("failed to parse jsonrpc request: {} {:#?}", line, err);
+            }
         }
     }
 
     drop(tx);
+
+    println!("sent {}/{} requests", count, config.count);
 
     let mut map = HashMap::with_capacity(count);
     let mut providers = Vec::with_capacity(num_providers);
@@ -136,6 +167,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut mismatched = 0;
 
+    // TODO: this is super slow. refactor
     for i in 0..count {
         if let Some((first_request, first_response)) = first_map.get(&i) {
             for p in providers.iter().skip(1) {
