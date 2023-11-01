@@ -1,11 +1,11 @@
 use argh::FromArgs;
-use ethers::providers::{Middleware, Provider, ProviderError};
+use counter::Counter;
 use futures::future::join_all;
-use serde::Deserialize;
-use std::collections::HashMap;
+use reqwest::Url;
+use std::sync::atomic::AtomicUsize;
 use tokio::io;
 use tokio::io::AsyncBufReadExt;
-use tokio::sync::broadcast;
+use tokio::time::Instant;
 
 fn default_count() -> usize {
     1_000
@@ -20,134 +20,179 @@ struct VersusConfig {
     /// how many rpc calls to test
     /// TODO: make this optional. if not set, read all of them
     #[argh(option, default = "default_count()")]
-    count: usize,
+    max_count: usize,
 }
 
-#[derive(Clone, Deserialize, Debug, PartialEq, Eq)]
-#[serde(untagged)]
-enum JsonRpcRequestEnum {
-    Request(JsonRpcRequest),
-    Batch(Vec<JsonRpcRequest>),
+struct HttpJsonRpcProvider {
+    next_id: AtomicUsize,
+    client: reqwest::Client,
+    url: Url,
 }
 
-#[derive(Clone, Deserialize, Debug, PartialEq, Eq)]
-struct JsonRpcRequest {
-    method: String,
-    params: Option<serde_json::Value>,
+impl HttpJsonRpcProvider {
+    fn new(url: Url, client: reqwest::Client) -> Self {
+        Self {
+            next_id: 1.into(),
+            client,
+            url,
+        }
+    }
+
+    /*
+    /// this intentionally does no json parsing of the response
+    /// TODO: make this generic. don't return Value
+    pub async fn request(&self, method: &str, params: &Value) -> anyhow::Result<Value> {
+        let next_id = self.next_id.fetch_add(1, atomic::Ordering::SeqCst);
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "id": next_id,
+        });
+
+        let response = self.send_supposed_json(request.to_string()).await?;
+
+        let response_json = serde_json::from_str(&response)?;
+
+        Ok(response_json)
+    }
+    */
+
+    /// this sends any String but it's supposed to be json
+    /// this allows us to test intentional errors
+    /// TODO: make this generic. don't return String
+    #[inline]
+    async fn send_supposed_json(&self, request: String) -> Result<String, reqwest::Error> {
+        self.client
+            .post(self.url.clone())
+            .header("content-type".to_string(), "application/json".to_string())
+            .body(request)
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await
+    }
+}
+
+struct App {
+    http_providers: Vec<HttpJsonRpcProvider>,
+    max_count: usize,
+}
+
+impl App {
+    async fn new(config: VersusConfig) -> anyhow::Result<Self> {
+        let mut http_providers = vec![];
+
+        // TODO: configure this with timeouts and such
+        let c = reqwest::Client::new();
+
+        for rpc in config.rpcs.iter() {
+            match Url::parse(rpc) {
+                Ok(url) => {
+                    let provider = HttpJsonRpcProvider::new(url, c.clone());
+
+                    http_providers.push(provider);
+                }
+                Err(err) => {
+                    println!("Failed parsing url for {}: {:#?}", rpc, err);
+                }
+            }
+        }
+
+        let x = Self {
+            http_providers,
+            max_count: config.max_count,
+        };
+
+        Ok(x)
+    }
+
+    /// read jsonrpc lines from stdin and send to all the providers
+    /// TODO: take a BufReader as input
+    async fn run(&self) -> anyhow::Result<()> {
+        // TODO: first check all of their chain ids
+
+        let stdin = io::stdin();
+
+        let reader = io::BufReader::new(stdin);
+
+        let mut lines = reader.lines();
+
+        let mut count = 0;
+
+        while let Some(line) = lines.next_line().await? {
+            self.send_supposed_json(line).await?;
+            count += 1;
+
+            if count >= self.max_count {
+                break;
+            }
+        }
+
+        println!("sent {}/{} requests", count, self.max_count);
+
+        Ok(())
+    }
+
+    async fn send_supposed_json(&self, request: String) -> anyhow::Result<()> {
+        // TODO: collect timings
+        let requests = self.http_providers.iter().map(|provider| {
+            let request = request.clone();
+            let start = Instant::now();
+            async move {
+                let response = provider.send_supposed_json(request).await;
+
+                let elapsed = start.elapsed();
+
+                (provider, response, elapsed)
+            }
+        });
+
+        let responses = join_all(requests).await;
+
+        // TODO: i think we also need a HashMap of response -> Vec<Provider>
+        let mut successes: Counter<String, usize> = Counter::new();
+        let mut errors: Counter<String, usize> = Counter::new();
+
+        for (provider, response, duration) in responses {
+            match response {
+                Ok(response) => {
+                    successes[&response] += 1;
+                }
+                Err(err) => {
+                    let err = format!("{:#?}", err);
+
+                    errors[&err] += 1;
+                }
+            }
+
+            println!("{} completed in {} ms", provider.url, duration.as_millis());
+        }
+
+        if errors.len() == 0 && successes.len() == 1 {
+            println!("all matched! yey!");
+            return Ok(());
+        }
+
+        println!("successes: {:#?}", successes);
+        println!("errors: {:#?}", errors);
+
+        Ok(())
+    }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config: VersusConfig = argh::from_env();
 
-    let mut expected_chain_id = None;
+    let app = App::new(config).await?;
 
-    let mut http_providers = vec![];
+    // TODO: optional timeout
+    app.run().await?;
 
-    for rpc in config.rpcs.iter() {
-        match Provider::try_from(rpc) {
-            Ok(provider) => {
-                let chain_id = provider.get_chainid().await?;
-
-                println!("{}: chain_id {:#?}", rpc, chain_id);
-
-                if let Some(expected_chain_id) = expected_chain_id {
-                    if expected_chain_id != chain_id {
-                        println!(
-                            "{} has unexpected chain_id: {} != {}",
-                            rpc, chain_id, expected_chain_id
-                        );
-                        continue;
-                    }
-                } else {
-                    expected_chain_id = Some(chain_id);
-                }
-
-                http_providers.push(provider);
-            }
-            Err(err) => {
-                println!("Failed connecting to {}: {:#?}", rpc, err);
-                continue;
-            }
-        }
-    }
-
-    let num_providers = http_providers.len();
-
-    if num_providers < 2 {
-        println!("need at least 2 providers");
-    }
-
-    // TODO: how should we handle lagged? for now we just set a potentially very high capacity
-    // TODO: i'd like to be able to send raw Strings so th
-    let (tx, _) = broadcast::channel::<(usize, JsonRpcRequestEnum)>(config.count);
-
-    let mut handles = Vec::with_capacity(num_providers);
-
-    // TODO: i don't like this. we have to keep all results in memory until the end. change to wait for all of them and then do the processing
-    for p in http_providers {
-        let mut rx = tx.subscribe();
-
-        let mut results = HashMap::with_capacity(config.count);
-
-        let handle = tokio::spawn(async move {
-            while let Ok((id, data)) = rx.recv().await {
-                // println!("{} {}: {:?}", p.url(), i, data);
-
-                match data {
-                    JsonRpcRequestEnum::Request(request) => {
-                        // TODO: spawn this so we can run in parallel
-                        let response: Result<serde_json::Value, ProviderError> =
-                            p.request(&request.method, &request.params).await;
-
-                        results.insert(id, (request, response));
-                    }
-                    JsonRpcRequestEnum::Batch(batch) => {
-                        for request in batch {
-                            // TODO: spawn this so we can run in parallel
-                            let response: Result<serde_json::Value, ProviderError> =
-                                p.request(&request.method, &request.params).await;
-
-                            results.insert(id, (request, response));
-                        }
-                    }
-                }
-            }
-
-            (p, results)
-        });
-
-        handles.push(handle);
-    }
-
-    // read jsonrpc lines from stdin and send to all the providers
-    let stdin = io::stdin();
-
-    let reader = io::BufReader::new(stdin);
-
-    let mut count = 0;
-    let mut lines = reader.lines();
-
-    while let Some(line) = lines.next_line().await? {
-        match serde_json::from_str::<JsonRpcRequestEnum>(&line) {
-            Ok(data) => {
-                tx.send((count, data)).expect("unable to send");
-
-                count += 1;
-                if count >= config.count {
-                    break;
-                }
-            }
-            Err(err) => {
-                println!("failed to parse jsonrpc request: {} {:#?}", line, err);
-            }
-        }
-    }
-
-    drop(tx);
-
-    println!("sent {}/{} requests", count, config.count);
-
+    /*
     let mut map = HashMap::with_capacity(count);
     let mut providers = Vec::with_capacity(num_providers);
 
@@ -221,6 +266,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     println!("all matched! yey!");
+
+     */
 
     Ok(())
 }
