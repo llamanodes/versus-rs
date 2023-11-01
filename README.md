@@ -6,5 +6,5 @@ Works similarly to https://github.com/inFURA/versus, but written in rust.
 ## Usage
 
   ```bash
-  cargo run -- http://127.0.0.1:8545 https://eth.llamarpc.com
+  ethspam --rpc https://ethereum.llamarpc.com | head -n10 | cargo run -- https://ethereum.llamarpc.com https://ethereum-staging.llamarpc.com https://rpc.ankr.com/eth
   ```
